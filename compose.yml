@@ -1,0 +1,102 @@
+# claude-vpn-devbox
+#
+# Two containers:
+#   gluetun - owns the network namespace, the VPN tunnel and a kill-switch firewall
+#   devbox  - your dev tools + Claude Code, sharing gluetun's network namespace
+#
+# Every byte the devbox sends leaves through the VPN. If the tunnel drops,
+# gluetun's firewall blocks traffic instead of falling back to your real IP.
+#
+# Configure everything in .env (copy .env.example, or run `bin/devbox init`).
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:${GLUETUN_TAG:-v3}
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - path: .env.vpn
+        required: false
+    environment:
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:?Set VPN_SERVICE_PROVIDER in .env}
+      VPN_TYPE: ${VPN_TYPE:-wireguard}
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:-}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
+      OPENVPN_USER: ${OPENVPN_USER:-}
+      OPENVPN_PASSWORD: ${OPENVPN_PASSWORD:-}
+      SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
+      SERVER_CITIES: ${SERVER_CITIES:-}
+      TZ: ${TZ:-UTC}
+      # Subnets the devbox may reach WITHOUT the VPN: Docker bridges (so it can
+      # reach host.docker.internal and containers you start on the host) and
+      # your LAN. Everything else must go through the tunnel.
+      FIREWALL_OUTBOUND_SUBNETS: ${FIREWALL_OUTBOUND_SUBNETS:-172.16.0.0/12}
+      # gluetun's control server defaults to :8000, which collides with
+      # common dev servers (php artisan serve, Django, uvicorn...). Move it.
+      HTTP_CONTROL_SERVER_ADDRESS: ${GLUETUN_CONTROL_ADDRESS:-127.0.0.1:9997}
+    # /etc/hosts is shared with the devbox, and Docker refuses extra_hosts on a
+    # container that borrows another's network, so host aliases live here.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    # Ports for anything you run *inside the devbox* must be published here,
+    # on gluetun, because the devbox has no network of its own.
+    # Host-side ports are configurable in .env to avoid clashes.
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT_3000:-3000}:3000   # Next.js / Express / Rails
+      - ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT_5173:-5173}:5173   # Vite
+      - ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT_8000:-8000}:8000   # Laravel / Django / uvicorn
+      - ${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT_8080:-8080}:8080   # misc / websockets
+    restart: unless-stopped
+
+  devbox:
+    build:
+      context: .
+      args:
+        USERNAME: ${DEVBOX_USER:-dev}
+        USER_UID: ${DEVBOX_UID:-1000}
+        USER_GID: ${DEVBOX_GID:-1000}
+        INSTALL_NODE: ${INSTALL_NODE:-true}
+        INSTALL_PYTHON: ${INSTALL_PYTHON:-true}
+        INSTALL_PHP: ${INSTALL_PHP:-false}
+        INSTALL_RUST: ${INSTALL_RUST:-false}
+        INSTALL_GO: ${INSTALL_GO:-false}
+        INSTALL_DOCKER_CLI: ${INSTALL_DOCKER_CLI:-true}
+    image: claude-vpn-devbox:local
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      PROJECTS_DIR: ${PROJECTS_DIR:?Set PROJECTS_DIR in .env}
+      CLAUDE_CONFIG_DIR: /home/${DEVBOX_USER:-dev}/.claude-devbox
+      TZ: ${TZ:-UTC}
+    # Optional git identity and tokens (see devbox.env.example). Kept in their
+    # own file so that anything you leave out stays unset, not empty.
+    env_file:
+      - path: devbox.env
+        required: false
+    volumes:
+      # Mounted at the SAME absolute path as on the host so that:
+      #  - `bin/devbox claude` can map your current directory 1:1
+      #  - Claude Code's per-project history/memory keys line up
+      #  - bind mounts in project compose files resolve when run via the socket
+      - ${PROJECTS_DIR}:${PROJECTS_DIR}
+      # Claude Code login, settings and history for the container. Kept apart
+      # from your host ~/.claude, whose MCP servers point at host processes.
+      - claude-config:/home/${DEVBOX_USER:-dev}/.claude-devbox
+      # Package caches survive rebuilds.
+      - cache:/home/${DEVBOX_USER:-dev}/.cache
+      - npm-cache:/home/${DEVBOX_USER:-dev}/.npm
+      - cargo-registry:/home/${DEVBOX_USER:-dev}/.cargo/registry
+    working_dir: ${PROJECTS_DIR}
+    init: true
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+volumes:
+  claude-config:
+  cache:
+  npm-cache:
+  cargo-registry:

@@ -1,0 +1,13 @@
+# Optional: let the devbox drive the host's Docker daemon.
+# Enable with COMPOSE_FILE=compose.yml:compose.docker.yml in .env.
+#
+# WARNING: access to the Docker socket is root-equivalent on the host.
+# Containers started this way run on the HOST network, NOT through the VPN.
+# See "Project stacks that use Docker Compose" in the README.
+
+services:
+  devbox:
+    group_add:
+      - ${DOCKER_GID:?Set DOCKER_GID in .env (stat -c %g /var/run/docker.sock)}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

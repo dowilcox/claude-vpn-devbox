@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# devbox - helper for claude-vpn-devbox
+# Symlink it onto your PATH:  ln -s "$PWD/bin/devbox" ~/.local/bin/devbox
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+ENV_FILE="$ROOT/.env"
+
+# Run compose from the repo so .env and a relative COMPOSE_FILE resolve there.
+compose() { (cd "$ROOT" && docker compose "$@"); }
+
+env_get() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  grep -E "^$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
+need_env() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "No .env found. Run: devbox init" >&2
+    exit 1
+  fi
+}
+
+# Map the caller's directory into the container. Works because PROJECTS_DIR is
+# mounted at the same absolute path inside the devbox.
+workdir() {
+  local projects
+  projects="$(env_get PROJECTS_DIR)"
+  projects="${projects%/}"
+  if [[ -n "$projects" && ( "$PWD" == "$projects" || "$PWD" == "$projects"/* ) ]]; then
+    printf '%s' "$PWD"
+  else
+    printf '%s' "$projects"
+  fi
+}
+
+exec_in() {
+  local tty_flag=()
+  [[ -t 0 && -t 1 ]] || tty_flag=(-T)
+  local wd
+  wd="$(workdir)"
+  if [[ "$wd" != "$PWD" ]]; then
+    echo "note: $PWD is outside PROJECTS_DIR; using $wd" >&2
+  fi
+  compose exec "${tty_flag[@]}" -w "$wd" devbox "$@"
+}
+
+cmd_init() {
+  if [[ -f "$ENV_FILE" ]]; then
+    echo ".env already exists; edit it directly." >&2
+    exit 1
+  fi
+  local projects="${1:-}"
+  if [[ -z "$projects" ]]; then
+    read -r -p "Projects folder to mount [$HOME/code]: " projects
+    projects="${projects:-$HOME/code}"
+  fi
+  projects="$(readlink -f "$projects")"
+  if [[ ! -d "$projects" ]]; then
+    echo "Not a directory: $projects" >&2
+    exit 1
+  fi
+  local tz="UTC"
+  if [[ -L /etc/localtime ]]; then
+    tz="$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')"
+  fi
+  sed -e "s#^PROJECTS_DIR=.*#PROJECTS_DIR=$projects#" \
+      -e "s#^DEVBOX_UID=.*#DEVBOX_UID=$(id -u)#" \
+      -e "s#^DEVBOX_GID=.*#DEVBOX_GID=$(id -g)#" \
+      -e "s#^TZ=.*#TZ=$tz#" \
+      "$ROOT/.env.example" > "$ENV_FILE"
+  if [[ -S /var/run/docker.sock ]]; then
+    sed -i "s#^\# DOCKER_GID=.*#\# DOCKER_GID=$(stat -c %g /var/run/docker.sock)#" "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+  echo "Wrote $ENV_FILE"
+  echo "Next: add your VPN provider settings to .env, then run: devbox up"
+}
+
+cmd_ip() {
+  echo "host:   $(curl -fsS --max-time 10 https://ipinfo.io/ip || echo '?')"
+  echo "devbox: $(compose exec -T devbox curl -fsS --max-time 10 https://ipinfo.io/ip || echo '?')"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: devbox <command> [args]
+
+  init [DIR]       create .env (DIR = projects folder to mount)
+  up               build if needed and start gluetun + devbox
+  down             stop and remove both containers
+  build            rebuild the devbox image (pulls the latest Claude Code)
+  restart          recreate the devbox (needed after gluetun restarts)
+  status           show container status and VPN health
+  logs [svc]       follow logs (default: gluetun)
+  ip               compare your host IP with the devbox's VPN IP
+  claude [args]    run Claude Code in the current project directory
+  shell [cmd...]   open a shell (or run a command) in the current directory
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    init)    cmd_init "$@" ;;
+    up)      need_env; compose up -d --build "$@" ;;
+    down)    need_env; compose down "$@" ;;
+    build)   need_env; compose build --pull --no-cache devbox "$@" && compose up -d devbox ;;
+    restart) need_env; compose up -d --force-recreate devbox ;;
+    status)  need_env; compose ps ;;
+    logs)    need_env; compose logs -f "${1:-gluetun}" ;;
+    ip)      need_env; cmd_ip ;;
+    claude)  need_env; exec_in claude "$@" ;;
+    shell|sh)
+      need_env
+      if [[ $# -eq 0 ]]; then exec_in bash -l; else exec_in "$@"; fi
+      ;;
+    help|-h|--help) usage ;;
+    *) echo "Unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
